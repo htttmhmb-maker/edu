@@ -19,7 +19,8 @@ HISTORY_LIMIT = 300
 RECENT_IN_PROMPT = 25
 
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# نماذج Groq الحالية (llama-3.3-70b-versatile لم يعد متاحًا). تُجرَّب بالترتيب عند خطأ 404
+MODELS = [m for m in [os.environ.get("GROQ_MODEL"), "openai/gpt-oss-120b", "openai/gpt-oss-20b"] if m]
 VERIFY = True       # مراجعة صحة الجواب بنداء ثانٍ (يقلل الأخطاء)
 MAX_ATTEMPTS = 6
 
@@ -46,29 +47,44 @@ SYSTEM_PROMPT = (
 )
 
 
-def _chat(messages, temperature, retries=4):
+def _parse_json(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        m = re.search(r"\{.*\}", text or "", re.S)
+        if m:
+            return json.loads(m.group(0))
+        raise
+
+
+def _chat(messages, temperature, retries=3):
     key = os.environ.get("GROQ_API_KEY")
     if not key:
         raise RuntimeError("متغير GROQ_API_KEY غير موجود")
     last = None
-    for attempt in range(retries):
-        try:
-            r = requests.post(
-                API_URL,
-                headers={"Authorization": f"Bearer {key}"},
-                json={"model": MODEL, "messages": messages, "temperature": temperature,
-                      "response_format": {"type": "json_object"}},
-                timeout=60,
-            )
-            if r.status_code == 429 or r.status_code >= 500:
-                last = f"HTTP {r.status_code}"
-                time.sleep(5 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            return json.loads(r.json()["choices"][0]["message"]["content"])
-        except (requests.RequestException, ValueError, KeyError) as e:
-            last = e
-            time.sleep(3)
+    for model in MODELS:
+        payload = {"model": model, "messages": messages, "temperature": temperature,
+                   "response_format": {"type": "json_object"}, "max_completion_tokens": 2000}
+        if model.startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = "low"
+        for attempt in range(retries):
+            try:
+                r = requests.post(API_URL, headers={"Authorization": f"Bearer {key}"},
+                                  json=payload, timeout=90)
+                if r.status_code in (404, 400) and "model" in r.text.lower():
+                    last = f"{model}: HTTP {r.status_code} {r.text[:200]}"
+                    print("Groq:", last)
+                    break                      # جرّب النموذج التالي
+                if r.status_code == 429 or r.status_code >= 500:
+                    last = f"{model}: HTTP {r.status_code}"
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                if not r.ok:
+                    raise RuntimeError(f"Groq HTTP {r.status_code}: {r.text[:300]}")
+                return _parse_json(r.json()["choices"][0]["message"]["content"])
+            except (requests.RequestException, ValueError, KeyError) as e:
+                last = e
+                time.sleep(3)
     raise RuntimeError(f"فشل الاتصال بـ Groq: {last}")
 
 
